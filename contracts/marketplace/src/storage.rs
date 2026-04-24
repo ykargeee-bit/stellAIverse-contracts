@@ -434,6 +434,43 @@ pub struct FeeTransitionState {
     pub current_step: u32,
 }
 
+#[derive(Clone)]
+#[contracttype]
+pub struct FeeStatus {
+    pub current_fee_bps: u32,
+    pub is_dynamic: bool,
+    pub last_updated: Option<u64>,
+    pub is_transitioning: bool,
+    pub transition_progress: Option<u32>,
+    pub oracle_data_age: u64,
+    pub congestion_factor: Option<i128>,
+    pub utilization_factor: Option<i128>,
+    pub volatility_factor: Option<i128>,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct NetworkMetrics {
+    pub network_congestion: i128,
+    pub platform_utilization: i128,
+    pub market_volatility: i128,
+    pub last_updated: u64,
+    pub data_source: String,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct FeeAdjustmentStats {
+    pub total_adjustments: u64,
+    pub current_fee_bps: u32,
+    pub last_adjustment_timestamp: u64,
+    pub network_congestion: i128,
+    pub platform_utilization: i128,
+    pub market_volatility: i128,
+    pub is_transitioning: bool,
+    pub transition_progress: u32,
+}
+
 pub fn set_fee_adjustment_params(env: &Env, params: &FeeAdjustmentParams) {
     env.storage()
         .instance()
@@ -516,6 +553,19 @@ pub fn set_fee_transition_state(env: &Env, state: &FeeTransitionState) {
 
 pub fn get_fee_transition_state(env: &Env) -> Option<FeeTransitionState> {
     env.storage().instance().get(&DataKey::FeeTransitionState)
+}
+
+pub fn get_last_oracle_update(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::LastOracleUpdate)
+        .unwrap_or(0)
+}
+
+pub fn set_last_oracle_update(env: &Env, timestamp: u64) {
+    env.storage()
+        .instance()
+        .set(&DataKey::LastOracleUpdate, &timestamp);
 }
 
 /* ---------------- LEASE CONFIGURATION ---------------- */

@@ -20,6 +20,7 @@ members = [
     "contracts/waitlist-tokens",
     "contracts/referral-rewards",
     "contracts/staking-bonuses",
+    "contracts/credit-score-nft",
     "lib",
     "shared",
 ]
