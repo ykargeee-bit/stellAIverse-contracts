@@ -26,6 +26,9 @@ jobs:
       - name: Install cargo-audit
         uses: taiki-e/install-action@cargo-audit
 
+      - name: Install wasm optimizer
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
       - name: Check Formatting
         run: cargo fmt -- --check
 
@@ -36,7 +39,7 @@ jobs:
         run: cargo audit
 
       - name: Build Contracts
-        run: cargo build --release --target wasm32-unknown-unknown
+        run: bash ./scripts/build-optimized-wasm.sh governance Cargo.toml
 
       - name: Property-Based Tests
         run: cargo test -p agent-nft -p marketplace -p execution-hub --lib prop_tests

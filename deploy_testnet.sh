@@ -1,66 +1,56 @@
 #!/bin/bash
+set -euo pipefail
 
 # Testnet Deployment Script for Optimized Governance Contract
 # This script deploys the gas-optimized governance contract to testnet
 
-echo "🚀 Deploying Gas-Optimized Governance Contract to Testnet"
-echo "=========================================================="
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$SCRIPT_DIR"
+
+echo "Deploying Gas-Optimized Governance Contract to Testnet"
+echo "======================================================="
 
 # Check if soroban-cli is installed
 if ! command -v soroban &> /dev/null; then
-    echo "❌ Error: soroban-cli is not installed"
+    echo "Error: soroban-cli is not installed"
     echo "Please install it first: https://developers.stellar.org/docs/soroban/getting-started/installation"
     exit 1
 fi
 
 # Check if we're on testnet
-echo "📋 Checking network configuration..."
+echo "Checking network configuration..."
 NETWORK="testnet"
-if [ -z "$SOROBAN_NETWORK_PASSPHRASE" ]; then
+if [ -z "${SOROBAN_NETWORK_PASSPHRASE:-}" ]; then
     export SOROBAN_NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
 fi
 
-echo "✅ Network: $NETWORK"
-echo "🔑 Network Passphrase: $SOROBAN_NETWORK_PASSPHRASE"
+echo "Network: $NETWORK"
+echo "Network Passphrase: $SOROBAN_NETWORK_PASSPHRASE"
 
 # Build the contract for deployment
-echo "🔨 Building optimized contract for deployment..."
-cd contracts/governance
-cargo build --release --target wasm32-unknown-unknown
+echo "Building optimized contract for deployment..."
+bash "$REPO_ROOT/scripts/build-optimized-wasm.sh" governance "$REPO_ROOT/Cargo.toml" >/dev/null
 
-if [ $? -ne 0 ]; then
-    echo "❌ Build failed!"
-    exit 1
-fi
-
-echo "✅ Build successful"
-
-# Create the WASM file
-WASM_FILE="target/wasm32-unknown-unknown/release/governance.wasm"
+WASM_FILE="$REPO_ROOT/target/wasm32-unknown-unknown/release/governance.wasm"
 if [ ! -f "$WASM_FILE" ]; then
-    echo "❌ WASM file not found at $WASM_FILE"
+    echo "WASM file not found at $WASM_FILE"
     exit 1
 fi
 
-echo "📦 WASM file created: $WASM_FILE"
+echo "WASM file created: $WASM_FILE"
 
 # Deploy the contract
-echo "🚀 Deploying contract to testnet..."
+echo "Deploying contract to testnet..."
 CONTRACT_ID=$(soroban contract deploy \
     --wasm "$WASM_FILE" \
     --source "$SOROBAN_DEPLOYER_KEY" \
     --network "$NETWORK")
 
-if [ $? -ne 0 ]; then
-    echo "❌ Deployment failed!"
-    exit 1
-fi
-
-echo "✅ Contract deployed successfully!"
-echo "📍 Contract ID: $CONTRACT_ID"
+echo "Contract deployed successfully!"
+echo "Contract ID: $CONTRACT_ID"
 
 # Initialize the contract with test parameters
-echo "⚙️ Initializing contract..."
+echo "Initializing contract..."
 ADMIN_ADDRESS="$SOROBAN_ADMIN_ADDRESS"
 TOKEN_ADDRESS="$SOROBAN_TOKEN_ADDRESS"
 
@@ -78,19 +68,14 @@ soroban contract invoke \
     --max_voting_period 1209600 \
     --min_proposal_deposit 1000
 
-if [ $? -ne 0 ]; then
-    echo "❌ Contract initialization failed!"
-    exit 1
-fi
-
-echo "✅ Contract initialized successfully!"
+echo "Contract initialized successfully!"
 
 # Verify deployment
-echo "🔍 Verifying deployment..."
+echo "Verifying deployment..."
 soroban contract inspect --id "$CONTRACT_ID" --network "$NETWORK"
 
 # Create deployment summary
-echo "📊 Creating deployment summary..."
+echo "Creating deployment summary..."
 cat > deployment_summary.md << EOF
 # Testnet Deployment Summary
 
@@ -126,10 +111,10 @@ soroban contract invoke --id $CONTRACT_ID --source YOUR_KEY --network $NETWORK -
 3. Deploy to mainnet after verification
 EOF
 
-echo "✅ Deployment summary created: deployment_summary.md"
+echo "Deployment summary created: deployment_summary.md"
 echo ""
-echo "🎉 Gas-optimized governance contract successfully deployed to testnet!"
-echo "📈 Expected gas savings: 12-16% across all staking operations"
+echo "Gas-optimized governance contract successfully deployed to testnet!"
+echo "Expected gas savings: 12-16% across all staking operations"
 echo ""
-echo "🔗 Contract Explorer: https://stellar.expert/explorer/testnet/contract/$CONTRACT_ID"
-echo "📋 Contract ID: $CONTRACT_ID"
+echo "Contract Explorer: https://stellar.expert/explorer/testnet/contract/$CONTRACT_ID"
+echo "Contract ID: $CONTRACT_ID"
