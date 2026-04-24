@@ -53,8 +53,11 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Install wasm optimizer
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
       - name: Build contracts (WASM)
-        run: cargo build --target wasm32-unknown-unknown --release
+        run: bash ./scripts/build-optimized-wasm.sh governance Cargo.toml
 
       # ── Python / Certora CLI ─────────────────────────────────────────────────
       - name: Set up Python

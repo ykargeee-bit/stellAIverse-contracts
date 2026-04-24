@@ -11,6 +11,7 @@ resolver = "2"
 codegen-units = 1
 opt-level = 'z'
 lto = true
+panic = "abort"
 debug = false
 strip = "symbols"
 overflow-checks = true
