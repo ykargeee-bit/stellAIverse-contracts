@@ -265,7 +265,7 @@ impl Governance {
             0
         };
 
-        let delegated_power = Self::calculate_delegated_power_to(&env, &address);
+        let delegated_power = Self::calculate_delegated_power_to(&env, &address, env.ledger().timestamp());
 
         let own_delegated_away = if let Some(delegation) = get_delegation(&env, &address) {
             delegation.amount
@@ -299,8 +299,10 @@ impl Governance {
         let token_client = token::Client::new(&env, &governance_token);
         let base_balance = token_client.balance(&delegator) as u128;
 
+        // Cache current timestamp to avoid multiple calls
+        let current_time = env.ledger().timestamp();
+        
         let escrow_power = if let Some(escrow) = get_vote_escrow(&env, &delegator) {
-            let current_time = env.ledger().timestamp();
             if escrow.lock_end > current_time {
                 (escrow.amount as u128 * escrow.multiplier as u128) / 10000u128
             } else {
@@ -311,22 +313,23 @@ impl Governance {
         };
 
         let available_power = base_balance + escrow_power;
-        let existing_delegation = get_delegation(&env, &delegator);
-        let new_total = amount;
-
-        if new_total > available_power {
+        
+        if amount > available_power {
             panic!("Insufficient voting power to delegate");
         }
 
+        // Check existing delegation only once
+        let old_delegation = get_delegation(&env, &delegator);
+        
         let delegation = Delegation {
             delegatee: delegatee.clone(),
-            amount: new_total,
+            amount,
         };
         set_delegation(&env, &delegator, &delegation);
 
         env.events().publish(
             (Symbol::new(&env, "VotingPowerDelegated"),),
-            (delegator, delegatee, new_total),
+            (delegator, delegatee, amount),
         );
     }
 
@@ -334,14 +337,9 @@ impl Governance {
     pub fn undelegate_voting_power(env: Env, delegator: Address) {
         delegator.require_auth();
 
-        if get_delegation(&env, &delegator).is_none() {
-            panic!("No delegation to remove");
-        }
-
-        if let Some(old_delegation) = get_delegation(&env, &delegator) {
-            storage::remove_delegator_from_list(&env, &old_delegation.delegatee, &delegator);
-        }
-
+        let old_delegation = get_delegation(&env, &delegator).expect("No delegation to remove");
+        
+        storage::remove_delegator_from_list(&env, &old_delegation.delegatee, &delegator);
         env.storage()
             .instance()
             .remove(&DataKey::Delegation(delegator.clone()));
@@ -370,11 +368,14 @@ impl Governance {
             panic!("Insufficient balance");
         }
 
+        // Pre-calculate multiplier to avoid repeated arithmetic
         let multiplier = 20000u32 + ((lock_duration_weeks - 4) * 20000u32) / 48;
-
         let contract_address = env.current_contract_address();
+        
+        // Transfer tokens first
         token_client.transfer(&locker, &contract_address, &(amount as i128));
 
+        // Cache timestamp and calculate lock_end once
         let current_time = env.ledger().timestamp();
         let lock_end = current_time + (lock_duration_weeks as u64 * 7 * 24 * 60 * 60);
 
@@ -497,9 +498,11 @@ impl Governance {
         // Base voting power from token balance
         let base_balance = token_client.balance(address) as u128;
 
+        // Cache timestamp to avoid multiple calls
+        let current_time = env.ledger().timestamp();
+        
         // Add vote escrow power
         let escrow_power = if let Some(escrow) = get_vote_escrow(env, address) {
-            let current_time = env.ledger().timestamp();
             if escrow.lock_end > current_time {
                 // Escrow is still locked, apply multiplier
                 (escrow.amount as u128 * escrow.multiplier as u128) / 10000u128
@@ -512,26 +515,25 @@ impl Governance {
         };
 
         // Calculate delegated power TO this address using reverse index
-        let delegated_power = Self::calculate_delegated_power_to(env, address);
+        let delegated_power = Self::calculate_delegated_power_to(env, address, current_time);
 
         base_balance + escrow_power + delegated_power
     }
 
-    fn calculate_delegated_power_to(env: &Env, delegatee: &Address) -> u128 {
+    fn calculate_delegated_power_to(env: &Env, delegatee: &Address, current_time: u64) -> u128 {
         let delegators = storage::get_delegators_to(env, delegatee);
         let mut total_delegated = 0u128;
+        let governance_token = get_governance_token(env);
+        let token_client = token::Client::new(env, &governance_token);
 
         for i in 0..delegators.len() {
             let delegator = delegators.get(i).unwrap();
             if let Some(delegation) = storage::get_delegation(env, &delegator) {
                 // Get delegator's base voting power (not including their own delegations)
-                let governance_token = get_governance_token(env);
-                let token_client = token::Client::new(env, &governance_token);
                 let base_balance = token_client.balance(&delegator) as u128;
 
                 // Add escrow power if exists
                 let escrow_power = if let Some(escrow) = storage::get_vote_escrow(env, &delegator) {
-                    let current_time = env.ledger().timestamp();
                     if escrow.lock_end > current_time {
                         (escrow.amount as u128 * escrow.multiplier as u128) / 10000u128
                     } else {
