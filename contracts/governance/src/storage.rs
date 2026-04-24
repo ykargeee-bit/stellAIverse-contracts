@@ -219,15 +219,9 @@ pub fn get_voting_mechanism(env: &Env) -> VotingMechanism {
 
 pub(crate) fn add_delegator_to_list(env: &Env, delegatee: &Address, delegator: &Address) {
     let mut delegators = get_delegators_to(env, delegatee);
-    // Check if already in list
-    let mut found = false;
-    for i in 0..delegators.len() {
-        if delegators.get(i).unwrap() == *delegator {
-            found = true;
-            break;
-        }
-    }
-    if !found {
+    
+    // Use contains() for more efficient lookup instead of manual iteration
+    if !delegators.contains(delegator) {
         delegators.push_back(delegator.clone());
         env.storage()
             .instance()
@@ -236,22 +230,27 @@ pub(crate) fn add_delegator_to_list(env: &Env, delegatee: &Address, delegator: &
 }
 
 pub(crate) fn remove_delegator_from_list(env: &Env, delegatee: &Address, delegator: &Address) {
-    let mut delegators = get_delegators_to(env, delegatee);
-    let mut new_delegators = Vec::new(env);
-    for i in 0..delegators.len() {
-        let addr = delegators.get(i).unwrap();
-        if addr != *delegator {
-            new_delegators.push_back(addr);
+    let delegators = get_delegators_to(env, delegatee);
+    
+    // Only proceed if delegator is actually in the list
+    if delegators.contains(delegator) {
+        let mut new_delegators = Vec::new(env);
+        for i in 0..delegators.len() {
+            let addr = delegators.get(i).unwrap();
+            if addr != *delegator {
+                new_delegators.push_back(addr);
+            }
         }
-    }
-    if new_delegators.len() > 0 {
-        env.storage()
-            .instance()
-            .set(&DataKey::DelegatorsTo(delegatee.clone()), &new_delegators);
-    } else {
-        env.storage()
-            .instance()
-            .remove(&DataKey::DelegatorsTo(delegatee.clone()));
+        
+        if new_delegators.len() > 0 {
+            env.storage()
+                .instance()
+                .set(&DataKey::DelegatorsTo(delegatee.clone()), &new_delegators);
+        } else {
+            env.storage()
+                .instance()
+                .remove(&DataKey::DelegatorsTo(delegatee.clone()));
+        }
     }
 }
 
