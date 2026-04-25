@@ -2,12 +2,20 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, IntoVal, Symbol, Vec,
+    Bytes, BytesN, Map, String,
 };
 
 // Interface for the AgentNFT contract
 #[soroban_sdk::contractclient(name = "AgentNFTClient")]
 pub trait AgentNFTInterface {
     fn transfer_agent(env: Env, agent_id: u64, from: Address, to: Address);
+}
+
+// Interface for Oracle contract
+#[soroban_sdk::contractclient(name = "OracleClient")]
+pub trait OracleInterface {
+    fn get_data(env: Env, key: Symbol) -> i128;
+    fn verify_cross_chain_proof(env: Env, proof: Bytes, target_chain: u32) -> bool;
 }
 
 #[derive(Clone)]
@@ -24,6 +32,9 @@ pub enum DataKey {
     WrappedToken(u128),
     LiquidityBalance,
     FeeBalance,
+    EmergencyMode,
+    SupportedChains,
+    BridgeProof(u64),
 }
 
 /// Configuration for M-of-N bridge signers (relayers / validators).
@@ -98,6 +109,12 @@ pub enum BridgeError {
     NotSigner = 17,
     WrappedTokenAlreadyMapped = 18,
     LiquidityUnderflow = 19,
+    OracleVerificationFailed = 20,
+    BridgeProofInvalid = 21,
+    InsufficientLiquidity = 22,
+    OracleNotConfigured = 23,
+    TargetChainUnsupported = 24,
+    EmergencyMode = 25,
 }
 
 #[contract]
@@ -146,6 +163,16 @@ impl BridgeManager {
             .instance()
             .set(&DataKey::LiquidityBalance, &0i128);
         env.storage().instance().set(&DataKey::FeeBalance, &0i128);
+        
+        // Initialize supported chains (Ethereum, Polygon, BSC, etc.)
+        let mut supported_chains = Vec::new(&env);
+        supported_chains.push_back(1u32); // Ethereum
+        supported_chains.push_back(137u32); // Polygon
+        supported_chains.push_back(56u32); // BSC
+        env.storage().instance().set(&DataKey::SupportedChains, &supported_chains);
+        
+        // Initialize emergency mode as false
+        env.storage().instance().set(&DataKey::EmergencyMode, &false);
 
         Ok(())
     }
@@ -208,6 +235,24 @@ impl BridgeManager {
         }
 
         owner.require_auth();
+
+        // Check emergency mode
+        if Self::is_emergency_mode(env.clone()) {
+            return Err(BridgeError::EmergencyMode);
+        }
+
+        // Check if target chain is supported
+        let supported_chains = Self::get_supported_chains(env.clone());
+        let mut chain_supported = false;
+        for chain in supported_chains.iter() {
+            if chain == target_chain {
+                chain_supported = true;
+                break;
+            }
+        }
+        if !chain_supported {
+            return Err(BridgeError::TargetChainUnsupported);
+        }
 
         // 1. Lock the Agent NFT in the bridge contract
         let agent_contract: Address = env
@@ -603,6 +648,196 @@ impl BridgeManager {
                 || req.status == BridgeStatus::OutboundCompleted
                 || req.status == BridgeStatus::PendingInbound
                 || req.status == BridgeStatus::InboundApproved)
+    }
+
+    /// Verify cross-chain bridge using oracle data
+    pub fn verify_bridge_with_oracle(
+        env: Env,
+        bridge_id: u64,
+        cross_chain_proof: Bytes,
+    ) -> Result<bool, BridgeError> {
+        let req: BridgeRequest = env
+            .storage()
+            .instance()
+            .get(&DataKey::BridgeRequest(bridge_id))
+            .ok_or(BridgeError::BridgeNotFound)?;
+
+        if req.status != BridgeStatus::OutboundCompleted {
+            return Err(BridgeError::InvalidStatus);
+        }
+
+        let oracle_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::OracleContract)
+            .ok_or(BridgeError::OracleNotConfigured)?;
+
+        let oracle_client = OracleClient::new(&env, &oracle_contract);
+        
+        // Verify the cross-chain proof using oracle
+        let is_valid = oracle_client.verify_cross_chain_proof(
+            &cross_chain_proof,
+            &req.target_chain,
+        );
+
+        if !is_valid {
+            return Err(BridgeError::BridgeProofInvalid);
+        }
+
+        // Store the verified proof
+        env.storage()
+            .instance()
+            .set(&DataKey::BridgeProof(bridge_id), &cross_chain_proof);
+
+        Ok(true)
+    }
+
+    /// Emergency pause/resume bridge operations (admin only)
+    pub fn toggle_emergency_mode(env: Env, admin: Address, emergency_mode: bool) -> Result<(), BridgeError> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::EmergencyMode, &emergency_mode);
+        
+        env.events().publish(
+            (Symbol::new(&env, "EmergencyModeToggled"),),
+            (emergency_mode, admin, env.ledger().timestamp()),
+        );
+
+        Ok(())
+    }
+
+    /// Add support for new target chain (admin only)
+    pub fn add_supported_chain(env: Env, admin: Address, chain_id: u32) -> Result<(), BridgeError> {
+        Self::require_admin(&env, &admin)?;
+        
+        let mut supported_chains: Vec<u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SupportedChains)
+            .unwrap_or(Vec::new(&env));
+
+        // Check if chain already supported
+        for chain in supported_chains.iter() {
+            if chain == chain_id {
+                return Err(BridgeError::TargetChainUnsupported);
+            }
+        }
+
+        supported_chains.push_back(chain_id);
+        env.storage().instance().set(&DataKey::SupportedChains, &supported_chains);
+
+        env.events().publish(
+            (Symbol::new(&env, "ChainSupportAdded"),),
+            (chain_id, admin),
+        );
+
+        Ok(())
+    }
+
+    /// Handle bridge failure and refund user
+    pub fn handle_bridge_failure(env: Env, bridge_id: u64, refund_to: Address) -> Result<(), BridgeError> {
+        let req: BridgeRequest = env
+            .storage()
+            .instance()
+            .get(&DataKey::BridgeRequest(bridge_id))
+            .ok_or(BridgeError::BridgeNotFound)?;
+
+        if req.status == BridgeStatus::Completed {
+            return Err(BridgeError::InvalidStatus);
+        }
+
+        // Refund the notional value minus fee
+        let refund_amount = req.notional_value;
+        
+        // Update liquidity balance
+        let mut liquidity: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LiquidityBalance)
+            .unwrap_or(0);
+        
+        liquidity = liquidity
+            .checked_sub(refund_amount)
+            .ok_or(BridgeError::LiquidityUnderflow)?;
+        
+        env.storage()
+            .instance()
+            .set(&DataKey::LiquidityBalance, &liquidity);
+
+        // Return the agent NFT to owner
+        let agent_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::AgentContract)
+            .ok_or(BridgeError::NotInitialized)?;
+        
+        let agent_client = AgentNFTClient::new(&env, &agent_contract);
+        agent_client.transfer_agent(&req.agent_id, &env.current_contract_address(), &refund_to);
+
+        // Update bridge status
+        let mut updated_req = req.clone();
+        updated_req.status = BridgeStatus::Cancelled;
+        updated_req.last_updated_at = env.ledger().timestamp();
+        
+        env.storage()
+            .instance()
+            .set(&DataKey::BridgeRequest(bridge_id), &updated_req);
+
+        // Remove locked agent flag
+        env.storage()
+            .instance()
+            .remove(&DataKey::LockedAgent(req.agent_id));
+
+        env.events().publish(
+            (Symbol::new(&env, "BridgeFailureHandled"),),
+            (bridge_id, refund_to, refund_amount),
+        );
+
+        Ok(())
+    }
+
+    /// Get bridge statistics for monitoring
+    pub fn get_bridge_stats(env: Env) -> Result<Map<Symbol, u64>, BridgeError> {
+        let stats = Map::new(&env);
+        
+        let bridge_counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BridgeCounter)
+            .unwrap_or(0);
+        
+        let liquidity: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LiquidityBalance)
+            .unwrap_or(0);
+        
+        let fees: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeBalance)
+            .unwrap_or(0);
+
+        stats.set(Symbol::new(&env, "total_bridges"), bridge_counter);
+        stats.set(Symbol::new(&env, "total_liquidity"), liquidity as u64);
+        stats.set(Symbol::new(&env, "total_fees"), fees as u64);
+
+        Ok(stats)
+    }
+
+    /// Check if bridge is in emergency mode
+    pub fn is_emergency_mode(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::EmergencyMode)
+            .unwrap_or(false)
+    }
+
+    /// Get supported chains
+    pub fn get_supported_chains(env: Env) -> Vec<u32> {
+        env.storage()
+            .instance()
+            .get(&DataKey::SupportedChains)
+            .unwrap_or(Vec::new(&env))
     }
 }
 
