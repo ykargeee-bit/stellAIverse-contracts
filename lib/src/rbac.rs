@@ -351,6 +351,21 @@ fn remove_from_kyc_operators(env: &Env, address: &Address) -> Result<(), Contrac
     Ok(())
 }
 
+/// Public function to remove KYC operator role (admin only)
+pub fn remove_kyc_operator_role(
+    env: &Env,
+    admin: &Address,
+    operator: &Address,
+) -> Result<(), ContractError> {
+    // Validate admin
+    require_admin(env, admin)?;
+    
+    // Remove from KYC operators
+    remove_from_kyc_operators(env, operator)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

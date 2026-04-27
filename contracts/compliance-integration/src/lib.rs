@@ -760,8 +760,14 @@ impl ComplianceIntegrationContract {
     // ── KYC State Machine ────────────────────────────────────────────────────
 
     /// Initialise a KYC record for a subject DID (starts in Pending).
-    pub fn kyc_init(env: Env, operator: Address, subject_did: String) -> Result<(), Error> {
+    pub fn kyc_init(env: Env, operator: Address, subject: Address, subject_did: String) -> Result<(), Error> {
         rbac::require_kyc_operator_role(&env, &operator).map_err(|_| Error::Unauthorized)?;
+        
+        // Prevent self-assignment: operator cannot assign KYC status to themselves
+        if operator == subject {
+            return Err(Error::KycSelfAssignment);
+        }
+        
         let key = (KYC_RECORDS, subject_did.clone());
         if env.storage().instance().has(&key) {
             return Err(Error::DuplicateReport);
@@ -797,13 +803,12 @@ impl ComplianceIntegrationContract {
         new_status: KycStatus,
     ) -> Result<(), Error> {
         rbac::require_kyc_operator_role(&env, &operator).map_err(|_| Error::Unauthorized)?;
-        let key = (KYC_RECORDS, subject_did.clone());
-        let mut record: KycRecord = env
-            .storage()
-            .instance()
-            .get(&key)
-            .ok_or(Error::KycSubjectNotFound)?;
-
+        
+        // Prevent self-assignment: operator cannot transition their own KYC status
+        if operator == subject {
+            return Err(Error::KycSelfAssignment);
+        }
+        
         let mut record = Self::get_kyc_record(&env, &subject)?;
         if record.status == KycStatus::Pending {
             if let Some(expires_at) = record.expires_at {
@@ -889,6 +894,15 @@ impl ComplianceIntegrationContract {
         Ok(execute_after)
     }
 
+    /// Alias for kyc_governance_override - schedules an override
+    pub fn kyc_schedule_override(
+        env: Env,
+        governance: Address,
+        subject: Address,
+    ) -> Result<u64, Error> {
+        Self::kyc_governance_override(env, governance, subject)
+    }
+
     /// Governance executes a previously scheduled override and resets the subject to Pending.
     pub fn kyc_execute_override(
         env: Env,
@@ -896,8 +910,8 @@ impl ComplianceIntegrationContract {
         subject: Address,
     ) -> Result<(), Error> {
         rbac::require_governance_role(&env, &governance).map_err(|_| Error::Unauthorized)?;
-        let key = (KYC_RECORDS, subject_did.clone());
-        let mut record: KycRecord = env
+        
+        let request: KycOverrideRequest = env
             .storage()
             .instance()
             .get(&(KYC_OVERRIDES, subject.clone()))
@@ -927,6 +941,69 @@ impl ComplianceIntegrationContract {
             (subject, record.subject_did, governance, KycStatus::Pending),
         );
         Ok(())
+    }
+
+    // ── KYC Helper Functions ─────────────────────────────────────────────────
+
+    /// Set or revoke KYC operator status (admin only)
+    pub fn kyc_set_operator(env: Env, admin: Address, operator: Address, is_operator: bool) -> Result<(), Error> {
+        Self::verify_admin(&env, &admin)?;
+        
+        if is_operator {
+            rbac::assign_kyc_operator_role(&env, &admin, &operator)
+                .map_err(|_| Error::Unauthorized)?;
+        } else {
+            rbac::remove_kyc_operator_role(&env, &admin, &operator)
+                .map_err(|_| Error::Unauthorized)?;
+        }
+        
+        Ok(())
+    }
+
+    /// Check if a subject has verified KYC status
+    pub fn kyc_is_verified(env: Env, subject: Address) -> bool {
+        match Self::get_kyc_record(&env, &subject) {
+            Ok(record) => record.status == KycStatus::Verified,
+            Err(_) => false,
+        }
+    }
+
+    /// Require verified KYC for sensitive operations
+    fn require_verified_kyc(env: &Env, subject: &Address) -> Result<(), Error> {
+        if !Self::kyc_is_verified(env.clone(), subject.clone()) {
+            return Err(Error::KycNotVerified);
+        }
+        Ok(())
+    }
+
+    /// Store a KYC record
+    fn put_kyc_record(env: &Env, subject: &Address, record: &KycRecord) {
+        env.storage()
+            .instance()
+            .set(&(KYC_RECORDS, subject.clone()), record);
+    }
+
+    /// Retrieve a KYC record
+    fn get_kyc_record(env: &Env, subject: &Address) -> Result<KycRecord, Error> {
+        env.storage()
+            .instance()
+            .get(&(KYC_RECORDS, subject.clone()))
+            .ok_or(Error::KycSubjectNotFound)
+    }
+
+    /// Check if a KYC status is terminal (Verified or Rejected)
+    fn is_terminal_kyc_status(status: KycStatus) -> bool {
+        matches!(status, KycStatus::Verified | KycStatus::Rejected)
+    }
+
+    /// Validate KYC state transition
+    fn is_valid_kyc_transition(from: KycStatus, to: KycStatus) -> bool {
+        matches!(
+            (from, to),
+            (KycStatus::Pending, KycStatus::InReview)
+                | (KycStatus::InReview, KycStatus::Verified)
+                | (KycStatus::InReview, KycStatus::Rejected)
+        )
     }
 
     /// Read the current KYC record for a subject.
