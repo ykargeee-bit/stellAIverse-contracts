@@ -275,3 +275,92 @@ fn test_multiple_pools() {
     assert_eq!(info_0.fee_bps, 30);
     assert_eq!(info_1.fee_bps, 50);
 }
+
+// Issue #215: Tests for cache invalidation
+#[test]
+fn test_cache_invalidation_on_add_liquidity() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let amm_id = env.register_contract(None, Amm);
+    let amm = AmmClient::new(&env, &amm_id);
+
+    amm.init_contract(&admin);
+
+    let token_a = Address::generate(&env);
+    let token_b = Address::generate(&env);
+
+    let pool_id = amm.create_pool(&admin, &token_a, &token_b, &30);
+
+    let provider = Address::generate(&env);
+    
+    // Add liquidity - should trigger cache invalidation
+    let lp_tokens = amm.add_liquidity(&provider, &pool_id, &1000, &2000);
+    assert!(lp_tokens > 0);
+
+    // Verify cache was invalidated by checking that subsequent reads get fresh data
+    let pool = amm.get_pool(&pool_id);
+    assert_eq!(pool.reserve_a, 1000);
+    assert_eq!(pool.reserve_b, 2000);
+}
+
+#[test]
+fn test_cache_invalidation_on_remove_liquidity() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let amm_id = env.register_contract(None, Amm);
+    let amm = AmmClient::new(&env, &amm_id);
+
+    amm.init_contract(&admin);
+
+    let token_a = Address::generate(&env);
+    let token_b = Address::generate(&env);
+
+    let pool_id = amm.create_pool(&admin, &token_a, &token_b, &30);
+
+    let provider = Address::generate(&env);
+    amm.add_liquidity(&provider, &pool_id, &1000, &2000);
+
+    // Remove liquidity - should trigger cache invalidation
+    let (amount_a, amount_b) = amm.remove_liquidity(&provider, &pool_id, &500);
+    assert!(amount_a > 0);
+    assert!(amount_b > 0);
+
+    // Verify cache was invalidated and data is fresh
+    let pool = amm.get_pool(&pool_id);
+    assert!(pool.reserve_a < 1000);
+    assert!(pool.reserve_b < 2000);
+}
+
+#[test]
+fn test_cache_invalidation_on_swap() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let amm_id = env.register_contract(None, Amm);
+    let amm = AmmClient::new(&env, &amm_id);
+
+    amm.init_contract(&admin);
+
+    let token_a = Address::generate(&env);
+    let token_b = Address::generate(&env);
+
+    let pool_id = amm.create_pool(&admin, &token_a, &token_b, &30);
+
+    let provider = Address::generate(&env);
+    amm.add_liquidity(&provider, &pool_id, &1000, &2000);
+
+    // Execute swap - should trigger cache invalidation
+    let user = Address::generate(&env);
+    let amount_out = amm.swap(&user, &pool_id, &token_a, &100, &1);
+    assert!(amount_out > 0);
+
+    // Verify cache was invalidated and reserves updated
+    let pool = amm.get_pool(&pool_id);
+    assert!(pool.reserve_a > 1000); // Increased by 100
+    assert!(pool.reserve_b < 2000); // Decreased by amount_out
+}

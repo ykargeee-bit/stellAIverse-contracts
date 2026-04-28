@@ -12,6 +12,12 @@ pub enum DataKey {
     Pool(u64),
     /// LP token balance: (pool_id, provider).
     LpBalance(u64, Address),
+    /// Cached price data for pool (Issue #215)
+    PriceCache(u64),
+    /// Cached reserve data for pool (Issue #215)
+    ReserveCache(u64),
+    /// Timestamp of last cache invalidation (Issue #215)
+    LastCacheInvalidation,
 }
 
 /// Represents a liquidity pool for a token pair.
