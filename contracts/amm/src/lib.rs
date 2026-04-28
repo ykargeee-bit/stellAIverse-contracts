@@ -113,6 +113,9 @@ impl Amm {
         let current_lp = get_lp_balance(&env, pool_id, &provider);
         set_lp_balance(&env, pool_id, &provider, current_lp + lp_minted);
 
+        // CRITICAL: Invalidate query cache after state change (Issue #215)
+        storage::invalidate_query_cache(&env, pool_id);
+
         env.events().publish(
             (Symbol::new(&env, "LiquidityAdded"),),
             (pool_id, &provider, amount_a, amount_b, lp_minted),
@@ -161,6 +164,9 @@ impl Amm {
 
         token_a_client.transfer(&contract_addr, &provider, &amount_a);
         token_b_client.transfer(&contract_addr, &provider, &amount_b);
+
+        // CRITICAL: Invalidate query cache after state change (Issue #215)
+        storage::invalidate_query_cache(&env, pool_id);
 
         env.events().publish(
             (Symbol::new(&env, "LiquidityRemoved"),),
@@ -234,6 +240,9 @@ impl Amm {
             pool.reserve_a -= amount_out;
         }
         set_pool(&env, &pool);
+
+        // CRITICAL: Invalidate query cache after state change (Issue #215)
+        storage::invalidate_query_cache(&env, pool_id);
 
         env.events().publish(
             (Symbol::new(&env, "Swapped"),),

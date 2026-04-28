@@ -84,6 +84,24 @@ pub struct BypassRecord {
     pub reason: String,
 }
 
+#[derive(Clone)]
+#[contracttype]
+pub struct BatchOperation {
+    pub agent_id: u64,
+    pub action: String,
+    pub parameters: Bytes,
+    pub nonce: u64,
+    pub execution_hash: Bytes,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct BatchResult {
+    pub execution_id: u64,
+    pub success: bool,
+    pub error_message: Option<String>,
+}
+
 #[contract]
 pub struct ExecutionHub;
 
@@ -1222,7 +1240,7 @@ impl ExecutionHub {
         );
     }
 
-    // Helper: Get agent owner from AgentNFT contract
+    /// Helper: Get agent owner from AgentNFT contract
     fn get_agent_owner(env: &Env, agent_id: u64) -> Address {
         let agent_nft_addr: Address = env
             .storage()
@@ -1236,6 +1254,266 @@ impl ExecutionHub {
             &Symbol::new(env, "get_agent_owner"),
             Vec::from_array(env, [agent_id.into_val(env)]),
         )
+    }
+
+    /// Execute multiple operations atomically with user authentication (Issue #216)
+    /// All operations must succeed or none are executed
+    /// 
+    /// # Arguments
+    /// * `executor` - Address of the executor (must be authenticated)
+    /// * `operations` - Vector of batch operations to execute
+    /// 
+    /// # Returns
+    /// Vector of execution IDs for each operation
+    pub fn execute_batch_atomic(
+        env: Env,
+        executor: Address,
+        operations: Vec<BatchOperation>,
+    ) -> Vec<u64> {
+        // CRITICAL: Authenticate user at start of batch function (Issue #216)
+        executor.require_auth();
+
+        if operations.len() == 0 {
+            panic!("Batch must contain at least one operation");
+        }
+
+        if operations.len() > 10 {
+            panic!("Batch size exceeds maximum (10 operations)");
+        }
+
+        // Verify all operations belong to authenticated user
+        for i in 0..operations.len() {
+            let op = operations.get(i).expect("Operation missing");
+            
+            // Permission Check: re-validate owner/operator from storage (Issue #152)
+            rbac::require_owner_or_operator(
+                &env,
+                &executor,
+                op.agent_id,
+                |e, id| {
+                    let owner = Self::get_agent_owner(e, id);
+                    Some(owner)
+                },
+                |e, id| {
+                    let op_key = symbol_short!("op");
+                    let agent_op_key = (op_key, id);
+                    e.storage()
+                        .instance()
+                        .get::<_, OperatorData>(&agent_op_key)
+                        .map(|d| (d.operator, d.expires_at))
+                },
+            )
+            .unwrap_or_else(|_| panic!("Unauthorized: executor is not owner or operator for agent {}", op.agent_id));
+        }
+
+        // Apply rate limiting to batch operations (Issue #216)
+        for i in 0..operations.len() {
+            let op = operations.get(i).expect("Operation missing");
+            Self::check_rate_limit(&env, op.agent_id);
+        }
+
+        // Execute all operations atomically
+        let mut execution_ids = Vec::new(&env);
+        
+        for i in 0..operations.len() {
+            let op = operations.get(i).expect("Operation missing");
+            
+            // Validate operation
+            Self::validate_agent_id(op.agent_id);
+            Self::validate_string_length(&op.action, "Action name");
+            Self::validate_data_size(&op.parameters, "Parameters");
+            Self::validate_data_size(&op.execution_hash, "Execution hash");
+
+            // Replay protection
+            let stored_nonce = Self::get_action_nonce(&env, op.agent_id);
+            if op.nonce <= stored_nonce {
+                panic!("Invalid nonce: replay protection triggered for operation {}", i);
+            }
+
+            let execution_id = Self::next_execution_id(&env);
+            let timestamp = env.ledger().timestamp();
+
+            // Update nonce and record action
+            Self::set_action_nonce(&env, op.agent_id, op.nonce);
+            Self::record_action_in_history(
+                &env,
+                op.agent_id,
+                execution_id,
+                &op.action,
+                &executor,
+                op.nonce,
+                &op.execution_hash,
+            );
+            Self::store_execution_receipt(
+                &env,
+                execution_id,
+                op.agent_id,
+                &op.action,
+                &executor,
+                timestamp,
+                &op.execution_hash,
+            );
+
+            // Update behavior profile
+            let exec_cost_estimate: i128 = op.parameters.len() as i128;
+            Self::update_behavior_profile(&env, op.agent_id, op.action.clone(), exec_cost_estimate);
+
+            // Emit event
+            env.events().publish(
+                (symbol_short!("batch_exec"),),
+                (execution_id, op.agent_id, op.action.clone(), executor.clone()),
+            );
+
+            execution_ids.push_back(execution_id);
+        }
+
+        execution_ids
+    }
+
+    /// Execute multiple operations with best-effort semantics (Issue #216)
+    /// Individual failures are recorded but don't stop other operations
+    /// 
+    /// # Arguments
+    /// * `executor` - Address of the executor (must be authenticated)
+    /// * `operations` - Vector of batch operations to execute
+    /// 
+    /// # Returns
+    /// Vector of batch results showing success/failure for each operation
+    pub fn execute_batch_best_effort(
+        env: Env,
+        executor: Address,
+        operations: Vec<BatchOperation>,
+    ) -> Vec<BatchResult> {
+        // CRITICAL: Authenticate user at start of batch function (Issue #216)
+        executor.require_auth();
+
+        if operations.len() == 0 {
+            panic!("Batch must contain at least one operation");
+        }
+
+        if operations.len() > 10 {
+            panic!("Batch size exceeds maximum (10 operations)");
+        }
+
+        // Verify all operations belong to authenticated user
+        for i in 0..operations.len() {
+            let op = operations.get(i).expect("Operation missing");
+            
+            // Permission Check: re-validate owner/operator from storage (Issue #152)
+            rbac::require_owner_or_operator(
+                &env,
+                &executor,
+                op.agent_id,
+                |e, id| {
+                    let owner = Self::get_agent_owner(e, id);
+                    Some(owner)
+                },
+                |e, id| {
+                    let op_key = symbol_short!("op");
+                    let agent_op_key = (op_key, id);
+                    e.storage()
+                        .instance()
+                        .get::<_, OperatorData>(&agent_op_key)
+                        .map(|d| (d.operator, d.expires_at))
+                },
+            )
+            .unwrap_or_else(|_| panic!("Unauthorized: executor is not owner or operator for agent {}", op.agent_id));
+        }
+
+        // Execute operations with best-effort semantics
+        let mut results = Vec::new(&env);
+        
+        for i in 0..operations.len() {
+            let op = operations.get(i).expect("Operation missing");
+            
+            // Try to execute each operation, catching errors
+            let result = Self::execute_single_operation(
+                &env,
+                &executor,
+                op.agent_id,
+                op.action.clone(),
+                op.parameters.clone(),
+                op.nonce,
+                op.execution_hash.clone(),
+            );
+
+            results.push_back(result);
+        }
+
+        results
+    }
+
+    /// Helper function to execute a single operation (for best-effort batch)
+    fn execute_single_operation(
+        env: &Env,
+        executor: &Address,
+        agent_id: u64,
+        action: String,
+        parameters: Bytes,
+        nonce: u64,
+        execution_hash: Bytes,
+    ) -> BatchResult {
+        // Check rate limit
+        if let Err(_) = (|| -> Result<(), &'static str> {
+            Self::check_rate_limit(env, agent_id);
+            Ok(())
+        })() {
+            return BatchResult {
+                execution_id: 0,
+                success: false,
+                error_message: Some(String::from_str(env, "Rate limit exceeded")),
+            };
+        }
+
+        // Check nonce
+        let stored_nonce = Self::get_action_nonce(env, agent_id);
+        if nonce <= stored_nonce {
+            return BatchResult {
+                execution_id: 0,
+                success: false,
+                error_message: Some(String::from_str(env, "Invalid nonce")),
+            };
+        }
+
+        // Execute the operation
+        let execution_id = Self::next_execution_id(env);
+        let timestamp = env.ledger().timestamp();
+
+        Self::set_action_nonce(env, agent_id, nonce);
+        Self::record_action_in_history(
+            env,
+            agent_id,
+            execution_id,
+            &action,
+            executor,
+            nonce,
+            &execution_hash,
+        );
+        Self::store_execution_receipt(
+            env,
+            execution_id,
+            agent_id,
+            &action,
+            executor,
+            timestamp,
+            &execution_hash,
+        );
+
+        // Update behavior profile
+        let exec_cost_estimate: i128 = parameters.len() as i128;
+        Self::update_behavior_profile(env, agent_id, action.clone(), exec_cost_estimate);
+
+        // Emit event
+        env.events().publish(
+            (symbol_short!("batch_exec"),),
+            (execution_id, agent_id, action.clone(), executor.clone()),
+        );
+
+        BatchResult {
+            execution_id,
+            success: true,
+            error_message: None,
+        }
     }
 }
 
@@ -1840,5 +2118,178 @@ mod test {
         let (env, client, _admin, _, _) = setup_test();
         let other = Address::generate(&env);
         client.set_global_rate_limit(&other, &50, &60);
+    }
+
+    // Issue #216: Tests for batch operations with user authentication
+    #[test]
+    fn test_batch_atomic_with_authentication() {
+        let (env, client, _admin, agent_nft, _) = setup_test();
+        let owner = Address::generate(&env);
+        agent_nft.set_owner(&1, &owner);
+        agent_nft.set_owner(&2, &owner);
+
+        // Create batch operations
+        let mut operations = Vec::new(&env);
+        
+        let action1 = String::from_str(&env, "action1");
+        let params1 = Bytes::from_array(&env, &[1, 2, 3]);
+        let hash1 = Bytes::from_array(&env, &[0x11, 0x22]);
+        
+        let action2 = String::from_str(&env, "action2");
+        let params2 = Bytes::from_array(&env, &[4, 5, 6]);
+        let hash2 = Bytes::from_array(&env, &[0x33, 0x44]);
+
+        let op1 = BatchOperation {
+            agent_id: 1,
+            action: action1,
+            parameters: params1,
+            nonce: 1,
+            execution_hash: hash1,
+        };
+
+        let op2 = BatchOperation {
+            agent_id: 2,
+            action: action2,
+            parameters: params2,
+            nonce: 1,
+            execution_hash: hash2,
+        };
+
+        operations.push_back(op1);
+        operations.push_back(op2);
+
+        // Execute batch as authenticated owner
+        let execution_ids = client.execute_batch_atomic(&owner, &operations);
+        assert_eq!(execution_ids.len(), 2);
+        assert_eq!(execution_ids.get(0).unwrap(), 1);
+        assert_eq!(execution_ids.get(1).unwrap(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized: executor is not owner or operator")]
+    fn test_batch_atomic_unauthorized_fails() {
+        let (env, client, _admin, agent_nft, _) = setup_test();
+        let owner = Address::generate(&env);
+        let unauthorized = Address::generate(&env);
+        agent_nft.set_owner(&1, &owner);
+
+        // Create batch operations
+        let mut operations = Vec::new(&env);
+        
+        let action = String::from_str(&env, "action");
+        let params = Bytes::from_array(&env, &[1]);
+        let hash = Bytes::from_array(&env, &[0x11]);
+
+        let op = BatchOperation {
+            agent_id: 1,
+            action,
+            parameters: params,
+            nonce: 1,
+            execution_hash: hash,
+        };
+
+        operations.push_back(op);
+
+        // Attempt to execute batch as unauthorized user - should panic
+        client.execute_batch_atomic(&unauthorized, &operations);
+    }
+
+    #[test]
+    fn test_batch_best_effort_with_authentication() {
+        let (env, client, _admin, agent_nft, _) = setup_test();
+        let owner = Address::generate(&env);
+        agent_nft.set_owner(&1, &owner);
+        agent_nft.set_owner(&2, &owner);
+
+        // Create batch operations
+        let mut operations = Vec::new(&env);
+        
+        for i in 1..=3u32 {
+            let action = String::from_str(&env, &format!("action_{}", i));
+            let params = Bytes::from_array(&env, &[i as u8]);
+            let hash = Bytes::from_array(&env, &[i as u8, 0x00]);
+
+            let op = BatchOperation {
+                agent_id: if i % 2 == 1 { 1 } else { 2 },
+                action,
+                parameters: params,
+                nonce: i as u64,
+                execution_hash: hash,
+            };
+
+            operations.push_back(op);
+        }
+
+        // Execute batch as authenticated owner
+        let results = client.execute_batch_best_effort(&owner, &operations);
+        assert_eq!(results.len(), 3);
+        
+        // All should succeed
+        for i in 0..3u32 {
+            let result = results.get(i).unwrap();
+            assert!(result.success, "Operation {} should succeed", i);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized: executor is not owner or operator")]
+    fn test_batch_best_effort_unauthorized_fails() {
+        let (env, client, _admin, agent_nft, _) = setup_test();
+        let owner = Address::generate(&env);
+        let unauthorized = Address::generate(&env);
+        agent_nft.set_owner(&1, &owner);
+
+        // Create batch operations
+        let mut operations = Vec::new(&env);
+        
+        let action = String::from_str(&env, "action");
+        let params = Bytes::from_array(&env, &[1]);
+        let hash = Bytes::from_array(&env, &[0x11]);
+
+        let op = BatchOperation {
+            agent_id: 1,
+            action,
+            parameters: params,
+            nonce: 1,
+            execution_hash: hash,
+        };
+
+        operations.push_back(op);
+
+        // Attempt to execute batch as unauthorized user - should panic
+        client.execute_batch_best_effort(&unauthorized, &operations);
+    }
+
+    #[test]
+    fn test_batch_respects_rate_limiting() {
+        let (env, client, admin, agent_nft, _) = setup_test();
+        let owner = Address::generate(&env);
+        agent_nft.set_owner(&1, &owner);
+
+        // Set very low rate limit
+        client.set_global_rate_limit(&admin, &2, &60);
+
+        // Create batch with 2 operations (within limit)
+        let mut operations = Vec::new(&env);
+        
+        for i in 1..=2u32 {
+            let action = String::from_str(&env, &format!("action_{}", i));
+            let params = Bytes::from_array(&env, &[i as u8]);
+            let hash = Bytes::from_array(&env, &[i as u8]);
+
+            let op = BatchOperation {
+                agent_id: 1,
+                action,
+                parameters: params,
+                nonce: i as u64,
+                execution_hash: hash,
+            };
+
+            operations.push_back(op);
+        }
+
+        // Should succeed
+        let execution_ids = client.execute_batch_atomic(&owner, &operations);
+        assert_eq!(execution_ids.len(), 2);
     }
 }

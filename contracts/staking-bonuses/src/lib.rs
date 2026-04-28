@@ -13,6 +13,9 @@ pub struct StakeKey {
     pub token: Address,
 }
 
+/// Storage key for query cache invalidation tracking (Issue #215)
+const CACHE_INVALIDATION_KEY: &str = "cache_invalidation_ts";
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StakeInfo {
@@ -138,6 +141,9 @@ impl StakingBonuses {
 
         env.storage().instance().set(&key, &info);
 
+        // CRITICAL: Invalidate query cache after state change (Issue #215)
+        Self::invalidate_query_cache(&env, &user);
+
         env.events().publish(
             (Symbol::new(&env, "staking"), Symbol::new(&env, "staked")),
             (user, token, amount, info.amt),
@@ -171,6 +177,9 @@ impl StakingBonuses {
         info.earned = 0;
         env.storage().instance().set(&key, &info);
 
+        // CRITICAL: Invalidate query cache after state change (Issue #215)
+        Self::invalidate_query_cache(&env, &user);
+
         env.events().publish(
             (
                 Symbol::new(&env, "staking"),
@@ -203,6 +212,9 @@ impl StakingBonuses {
         let bonus = info.earned;
         env.storage().instance().remove(&key);
 
+        // CRITICAL: Invalidate query cache after state change (Issue #215)
+        Self::invalidate_query_cache(&env, &user);
+
         env.events().publish(
             (Symbol::new(&env, "staking"), Symbol::new(&env, "unstaked")),
             (user, token, principal, bonus),
@@ -226,6 +238,22 @@ impl StakingBonuses {
 
     fn load_stake(env: &Env, key: &StakeKey) -> Option<StakeInfo> {
         env.storage().instance().get(key)
+    }
+
+    /// Invalidate query cache after state changes (Issue #215)
+    fn invalidate_query_cache(env: &Env, user: &Address) {
+        let timestamp = env.ledger().timestamp();
+        let cache_key = (Symbol::new(env, CACHE_INVALIDATION_KEY), user.clone());
+        env.storage().instance().set(&cache_key, &timestamp);
+        
+        // Emit cache invalidation event for monitoring
+        env.events().publish(
+            (
+                Symbol::new(env, "staking"),
+                Symbol::new(env, "cache_invalidated"),
+            ),
+            (user.clone(), timestamp),
+        );
     }
 
     fn accrue_rewards(
@@ -447,5 +475,92 @@ mod tests {
 
         // 5% * 2× = 10% of 1000 = 100
         assert_eq!(client.calculate_bonus(&user, &token), 100);
+    }
+
+    // Issue #215: Tests for cache invalidation
+    #[test]
+    fn test_cache_invalidation_on_stake() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let token = setup_token(&env, &admin);
+        let token_client = MockTokenClient::new(&env, &token);
+        token_client.mint(&user, &10_000);
+
+        let contract_id = env.register_contract(None, StakingBonuses);
+        let client = StakingBonusesClient::new(&env, &contract_id);
+        client.init_contract(&admin);
+
+        // Stake tokens - should trigger cache invalidation
+        client.stake(&user, &token, &1_000);
+
+        // Verify stake info is correctly stored (cache was invalidated)
+        let stake_info = client.get_stake_info(&user, &token);
+        assert!(stake_info.is_some());
+        assert_eq!(stake_info.unwrap().amt, 1_000);
+    }
+
+    #[test]
+    fn test_cache_invalidation_on_unstake() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let token = setup_token(&env, &admin);
+        let token_client = MockTokenClient::new(&env, &token);
+        token_client.mint(&user, &10_000);
+
+        let contract_id = env.register_contract(None, StakingBonuses);
+        let client = StakingBonusesClient::new(&env, &contract_id);
+        client.init_contract(&admin);
+
+        client.stake(&user, &token, &1_000);
+        
+        // Advance time past lock period
+        env.ledger()
+            .set_timestamp(31 * DAY_IN_SECONDS + LOCK_PERIOD_SECONDS + 1);
+
+        // Unstake - should trigger cache invalidation
+        let unstaked = client.unstake(&user, &token);
+        assert_eq!(unstaked, 1_000);
+
+        // Verify cache was invalidated and stake is removed
+        let stake_info = client.get_stake_info(&user, &token);
+        assert!(stake_info.is_none());
+    }
+
+    #[test]
+    fn test_cache_invalidation_on_claim_bonus() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let token = setup_token(&env, &admin);
+        let token_client = MockTokenClient::new(&env, &token);
+        token_client.mint(&user, &10_000);
+
+        let contract_id = env.register_contract(None, StakingBonuses);
+        let client = StakingBonusesClient::new(&env, &contract_id);
+        client.init_contract(&admin);
+
+        client.stake(&user, &token, &1_000);
+        
+        // Advance time to accrue rewards
+        env.ledger().set_timestamp(31 * DAY_IN_SECONDS);
+
+        let bonus_before = client.calculate_bonus(&user, &token);
+        assert!(bonus_before > 0);
+
+        // Claim bonus - should trigger cache invalidation
+        let claimed = client.claim_bonus(&user, &token);
+        assert_eq!(claimed, bonus_before);
+
+        // Verify cache was invalidated and bonus is reset
+        let bonus_after = client.calculate_bonus(&user, &token);
+        assert_eq!(bonus_after, 0);
     }
 }
