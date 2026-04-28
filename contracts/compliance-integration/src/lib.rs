@@ -120,6 +120,15 @@ pub struct ReputationReview {
     pub created_at: u64,
 }
 
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct ReputationUpdatedEvent {
+    pub entity_did: String,
+    pub new_score: u32,
+    pub updated_by: Address,
+    pub timestamp: u64,
+}
+
 // ── KYC State Machine Types ───────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -162,6 +171,7 @@ const KYC_RECORDS: Symbol = symbol_short!("KYC_REC");
 const KYC_OVERRIDES: Symbol = symbol_short!("KYC_OVR");
 const NEXT_REPORT_ID: Symbol = symbol_short!("N_REP_ID");
 const NEXT_REVIEW_ID: Symbol = symbol_short!("N_REV_ID");
+const REPUTATION_SCORES: Symbol = symbol_short!("REP_SC");
 
 const KYC_PENDING_EXPIRY_SECS: u64 = 86400 * 7; // 7 days
 const KYC_OVERRIDE_TIMELOCK_SECS: u64 = 86400 * 2; // 2 days
@@ -301,20 +311,81 @@ impl ComplianceIntegrationContract {
         Ok(review_id)
     }
 
-    // ── KYC Management (Task #190 Implementation) ────────────────────────────────
+    fn update_reputation_from_review(env: Env, entity_did: String, rating: u32, category: &String) {
+        let mut reputation = Self::get_reputation_score(env.clone(), entity_did.clone()).unwrap();
 
-    /// Initialize a new KYC request for a subject.
-    /// Only KYC operators can initiate requests.
+        // Update category score
+        let current_category_score = reputation
+            .category_scores
+            .get(category.clone())
+            .unwrap_or(50);
+        let review_count = reputation.review_count + 1;
+
+        // Calculate new category score (weighted average)
+        let new_category_score =
+            (current_category_score * (review_count - 1) + rating * 20) / review_count; // Rating 1-5 -> 20-100 scale
+        reputation
+            .category_scores
+            .set(category.clone(), new_category_score);
+
+        // Update overall score
+        let mut total_category_score = 0;
+        let mut category_count = 0;
+        for (_, score) in reputation.category_scores.iter() {
+            total_category_score += score;
+            category_count += 1;
+        }
+
+        if category_count > 0 {
+            reputation.overall_score = total_category_score / category_count;
+        }
+
+        reputation.review_count = review_count;
+        reputation.last_updated = env.ledger().timestamp();
+
+        // Store updated reputation
+        env.storage()
+            .instance()
+            .set(&(REPUTATION_SCORES, entity_did.clone()), &reputation);
+
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "ReputationUpdated"), entity_did.clone()),
+            ReputationUpdatedEvent {
+                entity_did: entity_did.clone(),
+                new_score: reputation.overall_score,
+                updated_by: env.current_contract_address(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    fn increment_counter(env: Env, counter_key: &Symbol) -> u64 {
+        let count: u64 = env.storage().instance().get(counter_key).unwrap_or(0);
+        let new_count = count + 1;
+        env.storage().instance().set(counter_key, &new_count);
+        new_count
+    }
+
+    // ── KYC State Machine ────────────────────────────────────────────────────
+
+    /// Initialise a KYC record for a subject DID (starts in Pending).
     pub fn kyc_init(
         env: Env,
         operator: Address,
         subject: Address,
         subject_did: String,
     ) -> Result<(), Error> {
-        rbac::require_kyc_operator_role(&env, &operator).map_err(|_| Error::KycOperatorRequired)?;
+        rbac::require_kyc_operator_role(&env, &operator).map_err(|_| Error::Unauthorized)?;
 
+        // Prevent self-assignment: operator cannot assign KYC status to themselves
         if operator == subject {
             return Err(Error::KycSelfAssignment);
+        }
+
+        let key = (KYC_RECORDS, subject_did.clone());
+        if env.storage().instance().has(&key) {
+            return Err(Error::DuplicateReport);
         }
 
         let now = env.ledger().timestamp();
@@ -351,6 +422,13 @@ impl ComplianceIntegrationContract {
     ) -> Result<(), Error> {
         rbac::require_kyc_operator_role(&env, &operator).map_err(|_| Error::KycOperatorRequired)?;
 
+        if operator == subject {
+            return Err(Error::KycSelfAssignment);
+        }
+
+        rbac::require_kyc_operator_role(&env, &operator).map_err(|_| Error::Unauthorized)?;
+
+        // Prevent self-assignment: operator cannot transition their own KYC status
         if operator == subject {
             return Err(Error::KycSelfAssignment);
         }
@@ -480,29 +558,43 @@ impl ComplianceIntegrationContract {
         Ok(())
     }
 
-    /// Retrieve the KYC record for a subject.
-    pub fn kyc_get(env: Env, subject: Address) -> Result<KycRecord, Error> {
-        Self::get_kyc_record(&env, &subject)
-    }
+    // ── KYC Helper Functions ─────────────────────────────────────────────────
 
-    /// Check if a subject is currently verified.
-    pub fn kyc_is_verified(env: Env, subject: Address) -> bool {
-        if let Ok(record) = Self::get_kyc_record(&env, &subject) {
-            record.status == KycStatus::Verified
+    /// Set or revoke KYC operator status (admin only)
+    pub fn kyc_set_operator(
+        env: Env,
+        admin: Address,
+        operator: Address,
+        is_operator: bool,
+    ) -> Result<(), Error> {
+        Self::verify_admin(&env, &admin)?;
+
+        if is_operator {
+            rbac::assign_kyc_operator_role(&env, &admin, &operator)
+                .map_err(|_| Error::Unauthorized)?;
         } else {
-            false
+            rbac::remove_kyc_operator_role(&env, &admin, &operator)
+                .map_err(|_| Error::Unauthorized)?;
         }
-    }
 
-    /// Set the initial KYC operator (Admin only).
-    pub fn kyc_set_operator(env: Env, admin: Address, operator: Address) -> Result<(), Error> {
-        admin.require_auth();
-        rbac::require_admin(&env, &admin).map_err(|_| Error::Unauthorized)?;
-        rbac::assign_kyc_operator_role(&env, &admin, &operator).map_err(|_| Error::Unauthorized)?;
         Ok(())
     }
 
-    // ── Internal Helpers ─────────────────────────────────────────────────────────
+    /// Check if a subject has verified KYC status
+    pub fn kyc_is_verified(env: Env, subject: Address) -> bool {
+        match Self::get_kyc_record(&env, &subject) {
+            Ok(record) => record.status == KycStatus::Verified,
+            Err(_) => false,
+        }
+    }
+
+    /// Require verified KYC for sensitive operations
+    fn require_verified_kyc(env: &Env, subject: &Address) -> Result<(), Error> {
+        if !Self::kyc_is_verified(env.clone(), subject.clone()) {
+            return Err(Error::KycNotVerified);
+        }
+        Ok(())
+    }
 
     fn get_kyc_record(env: &Env, subject: &Address) -> Result<KycRecord, Error> {
         env.storage()
@@ -533,19 +625,31 @@ impl ComplianceIntegrationContract {
         }
     }
 
-    fn require_verified_kyc(env: &Env, subject: &Address) -> Result<(), Error> {
-        if !Self::kyc_is_verified(env.clone(), subject.clone()) {
-            return Err(Error::KycNotVerified);
-        }
-        Ok(())
-    }
-
     fn get_next_report_id(env: &Env) -> u64 {
         env.storage().instance().get(&NEXT_REPORT_ID).unwrap_or(1)
     }
 
     fn get_next_review_id(env: &Env) -> u64 {
         env.storage().instance().get(&NEXT_REVIEW_ID).unwrap_or(1)
+    }
+
+    fn verify_admin(env: &Env, caller: &Address) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(env, "admin"))
+            .ok_or(Error::Unauthorized)?;
+        if caller != &admin {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
+    }
+
+    fn get_reputation_score(env: Env, entity_did: String) -> Result<ReputationScore, Error> {
+        env.storage()
+            .instance()
+            .get(&(REPUTATION_SCORES, entity_did))
+            .ok_or(Error::ReportNotFound)
     }
 }
 
