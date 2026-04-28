@@ -1149,10 +1149,7 @@ impl Governance {
                     }
                 }
             }
-            _ => {
-                // Numeric validation skipped for now as it requires parsing String to number
-            }
-        }
+           
     }
     /// Create storage snapshot for integrity validation
     fn create_storage_snapshot(env: &Env, target_contract: &Address, target_args: &Vec<Val>) {
