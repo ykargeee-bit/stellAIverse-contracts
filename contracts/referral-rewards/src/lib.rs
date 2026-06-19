@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec};
 use stellai_lib::{admin, errors::ContractError, ADMIN_KEY};
 
 #[contracttype]
@@ -45,9 +45,10 @@ impl ReferralRewards {
 
     /// Register a new referral.
     pub fn register_referral(
-        env: Env,Self-referral
-        }
-
+        env: Env,
+        referred: Address,
+        referrer: Address,
+    ) -> Result<(), ContractError> {
         // Check for circular referral
         let referrer_referrer_key = (Symbol::new(&env, "ref"), referrer.clone());
         if let Some(referrer_info) = env.storage().instance().get::<_, ReferralInfo>(&referrer_referrer_key) {
@@ -89,14 +90,7 @@ impl ReferralRewards {
         let referrals_key = (Symbol::new(&env, "referrals"), referrer.clone());
         let mut referrals: Vec<Address> = env.storage().instance().get(&referrals_key).unwrap_or(Vec::new(&env));
         referrals.push_back(referred.clone());
-        env.storage().instance().set(&referrals_key, &referrals
-        env.storage().instance().set(&key, &info);
-
-        // Update referrer's count
-        let count_key = (Symbol::new(&env, "count"), referrer.clone());
-        let mut count: u32 = env.storage().instance().get(&count_key).unwrap_or(0);
-        count += 1;
-        env.storage().instance().set(&count_key, &count);
+        env.storage().instance().set(&referrals_key, &referrals);
 
         env.events().publish(
             (
