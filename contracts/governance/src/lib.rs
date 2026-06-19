@@ -1149,7 +1149,20 @@ impl Governance {
                     }
                 }
             }
-           
+            ParameterType::U64 | ParameterType::I64 | ParameterType::U128 => {
+                // Basic format validation for numeric types
+                // In a full implementation, we would properly parse the string into the correct numeric type
+                if value.is_empty() {
+                    panic!("Invalid numeric value - empty string");
+                }
+            }
+            ParameterType::Address => {
+                // Validate address format - ensure string isn't empty
+                if value.is_empty() {
+                    panic!("Invalid address - empty string");
+                }
+            }
+        }
     }
     /// Create storage snapshot for integrity validation
     fn create_storage_snapshot(env: &Env, target_contract: &Address, target_args: &Vec<Val>) {
