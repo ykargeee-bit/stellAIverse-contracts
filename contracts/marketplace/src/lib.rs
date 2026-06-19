@@ -9,6 +9,8 @@ mod storage;
 #[cfg(test)]
 mod test_dynamic_fee_enhancement;
 
+use payment_types::PaymentRecord;
+use payments::{calculate_splits, execute_payment_routing, PaymentRoutingContext};
 use soroban_sdk::{
     contract, contractimpl, token, Address, Bytes, BytesN, Env, IntoVal, Map, String, Symbol,
     TryIntoVal, Val, Vec,
@@ -25,9 +27,7 @@ use stellai_lib::{
     },
     validation,
 };
-use payment_types::PaymentRecord;
-use payments::{calculate_splits, execute_payment_routing, PaymentRoutingContext};
-use storage::{*, Escrow, EscrowConfig, EscrowStatus};
+use storage::{Escrow, EscrowConfig, EscrowStatus, *};
 
 #[contract]
 pub struct Marketplace;
@@ -1973,8 +1973,6 @@ impl Marketplace {
         );
     }
 
-
-
     // ============ ATOMIC TRANSACTION ROLLBACK FUNCTIONS ============
 
     /// Unlock a listing (rollback function)
@@ -1997,17 +1995,20 @@ impl Marketplace {
         let buyer_escrows = get_buyer_escrows(&env, &buyer);
         for escrow_id in buyer_escrows.iter() {
             if let Some(mut escrow) = get_escrow(&env, escrow_id) {
-                if escrow.status == EscrowStatus::Held && escrow.amount >= amount && escrow.buyer == buyer {
+                if escrow.status == EscrowStatus::Held
+                    && escrow.amount >= amount
+                    && escrow.buyer == buyer
+                {
                     // Transfer funds back to buyer
                     let payment_token = get_payment_token(&env);
                     let token_client = token::Client::new(&env, &payment_token);
                     token_client.transfer(&env.current_contract_address(), &buyer, &amount);
-                    
+
                     // Update escrow status
                     escrow.status = EscrowStatus::Refunded;
                     escrow.dispute_resolved_at = Some(env.ledger().timestamp());
                     set_escrow(&env, &escrow);
-                    
+
                     env.events().publish(
                         (Symbol::new(&env, "escrow_refunded"),),
                         (escrow_id, buyer.clone(), amount),
@@ -2022,15 +2023,18 @@ impl Marketplace {
     /// Buyer confirms receipt of the agent, releasing funds from escrow to seller
     pub fn confirm_receipt(env: Env, escrow_id: u64, buyer: Address) {
         buyer.require_auth();
-        
+
         let mut escrow = get_escrow(&env, escrow_id).expect("Escrow not found");
         assert!(escrow.buyer == buyer, "Only buyer can confirm receipt");
-        assert!(escrow.status == EscrowStatus::Held, "Escrow is not in held status");
-        
+        assert!(
+            escrow.status == EscrowStatus::Held,
+            "Escrow is not in held status"
+        );
+
         // Release funds to seller by routing payment
         let platform_fee_bps = Self::get_platform_fee(env.clone());
         let royalty_info = Marketplace::get_royalty(env.clone(), escrow.agent_id);
-        
+
         Self::route_sale_payment(
             &env,
             escrow.agent_id,
@@ -2040,13 +2044,13 @@ impl Marketplace {
             royalty_info,
             platform_fee_bps,
         );
-        
+
         // Update escrow status
         escrow.status = EscrowStatus::Released;
         escrow.dispute_resolved_at = Some(env.ledger().timestamp());
         escrow.resolved_by = Some(buyer.clone());
         set_escrow(&env, &escrow);
-        
+
         env.events().publish(
             (Symbol::new(&env, "escrow_released"),),
             (escrow_id, escrow.seller.clone(), escrow.amount),
@@ -2056,15 +2060,18 @@ impl Marketplace {
     /// Buyer opens a dispute on an escrow, requiring admin resolution
     pub fn open_dispute(env: Env, escrow_id: u64, buyer: Address, reason: String) {
         buyer.require_auth();
-        
+
         let mut escrow = get_escrow(&env, escrow_id).expect("Escrow not found");
         assert!(escrow.buyer == buyer, "Only buyer can open a dispute");
-        assert!(escrow.status == EscrowStatus::Held, "Escrow is not in held status");
-        
+        assert!(
+            escrow.status == EscrowStatus::Held,
+            "Escrow is not in held status"
+        );
+
         // Update escrow status to disputed
         escrow.status = EscrowStatus::Disputed;
         set_escrow(&env, &escrow);
-        
+
         env.events().publish(
             (Symbol::new(&env, "dispute_opened"),),
             (escrow_id, buyer.clone(), reason),
@@ -2072,21 +2079,30 @@ impl Marketplace {
     }
 
     /// Admin resolves a dispute, deciding whether to release funds to seller or refund buyer
-    pub fn resolve_dispute(env: Env, escrow_id: u64, admin: Address, release_to_seller: bool, reason: String) {
+    pub fn resolve_dispute(
+        env: Env,
+        escrow_id: u64,
+        admin: Address,
+        release_to_seller: bool,
+        reason: String,
+    ) {
         admin.require_auth();
         Self::verify_admin(&env, &admin);
-        
+
         let mut escrow = get_escrow(&env, escrow_id).expect("Escrow not found");
-        assert!(escrow.status == EscrowStatus::Disputed, "Escrow is not in disputed status");
-        
+        assert!(
+            escrow.status == EscrowStatus::Disputed,
+            "Escrow is not in disputed status"
+        );
+
         let payment_token = get_payment_token(&env);
         let token_client = token::Client::new(&env, &payment_token);
-        
+
         if release_to_seller {
             // Release funds to seller
             let platform_fee_bps = Self::get_platform_fee(env.clone());
             let royalty_info = Marketplace::get_royalty(env.clone(), escrow.agent_id);
-            
+
             Self::route_sale_payment(
                 &env,
                 escrow.agent_id,
@@ -2099,14 +2115,18 @@ impl Marketplace {
             escrow.status = EscrowStatus::Released;
         } else {
             // Refund full amount to buyer
-            token_client.transfer(&env.current_contract_address(), &escrow.buyer, &escrow.amount);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &escrow.buyer,
+                &escrow.amount,
+            );
             escrow.status = EscrowStatus::Refunded;
         }
-        
+
         escrow.dispute_resolved_at = Some(env.ledger().timestamp());
         escrow.resolved_by = Some(admin.clone());
         set_escrow(&env, &escrow);
-        
+
         env.events().publish(
             (Symbol::new(&env, "dispute_resolved"),),
             (escrow_id, release_to_seller, reason),
@@ -2124,7 +2144,7 @@ impl Marketplace {
                 // Auto-release funds to seller
                 let platform_fee_bps = Self::get_platform_fee(env.clone());
                 let royalty_info = Marketplace::get_royalty(env.clone(), escrow.agent_id);
-                
+
                 Self::route_sale_payment(
                     &env,
                     escrow.agent_id,
@@ -2134,11 +2154,11 @@ impl Marketplace {
                     royalty_info,
                     platform_fee_bps,
                 );
-                
+
                 escrow.status = EscrowStatus::Released;
                 escrow.dispute_resolved_at = Some(now);
                 set_escrow(&env, &escrow);
-                
+
                 env.events().publish(
                     (Symbol::new(&env, "escrow_auto_released"),),
                     (escrow_id, escrow.seller.clone(), escrow.amount),
@@ -2149,16 +2169,21 @@ impl Marketplace {
     }
 
     /// Admin sets escrow configuration (auto-release period and dispute window)
-    pub fn set_escrow_config(env: Env, admin: Address, auto_release_period: u64, dispute_window: u64) {
+    pub fn set_escrow_config(
+        env: Env,
+        admin: Address,
+        auto_release_period: u64,
+        dispute_window: u64,
+    ) {
         admin.require_auth();
         Self::verify_admin(&env, &admin);
-        
+
         let config = EscrowConfig {
             auto_release_period_seconds: auto_release_period,
             dispute_window_seconds: dispute_window,
         };
         set_escrow_config(&env, &config);
-        
+
         env.events().publish(
             (Symbol::new(&env, "escrow_config_updated"),),
             (auto_release_period, dispute_window),

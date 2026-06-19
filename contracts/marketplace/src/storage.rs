@@ -74,8 +74,8 @@ pub enum DataKey {
     LeaseHistory(u64, u64),
     EscrowConfig, // Auto-release period and other escrow settings
     EscrowCounter,
-    Escrow(u64), // Individual escrow entry by ID
-    BuyerEscrows(Address, u64), // (buyer address, escrow_id)
+    Escrow(u64),                 // Individual escrow entry by ID
+    BuyerEscrows(Address, u64),  // (buyer address, escrow_id)
     SellerEscrows(Address, u64), // (seller address, escrow_id)
 }
 
@@ -788,7 +788,7 @@ pub fn get_escrow_config(env: &Env) -> EscrowConfig {
         .get(&DataKey::EscrowConfig)
         .unwrap_or(EscrowConfig {
             auto_release_period_seconds: 604800, // 7 days
-            dispute_window_seconds: 259200,     // 3 days
+            dispute_window_seconds: 259200,      // 3 days
         })
 }
 
@@ -807,24 +807,32 @@ pub fn increment_escrow_counter(env: &Env) -> u64 {
 
 pub fn set_escrow(env: &Env, escrow: &Escrow) {
     // Store by escrow ID
-    env.storage().instance().set(&DataKey::Escrow(escrow.escrow_id), escrow);
+    env.storage()
+        .instance()
+        .set(&DataKey::Escrow(escrow.escrow_id), escrow);
     // Index for buyer and seller
     let mut buyer_index = 0;
-    while env.storage().instance().has(&DataKey::BuyerEscrows(escrow.buyer.clone(), buyer_index as u64)) {
+    while env.storage().instance().has(&DataKey::BuyerEscrows(
+        escrow.buyer.clone(),
+        buyer_index as u64,
+    )) {
         buyer_index += 1;
     }
     env.storage().instance().set(
         &DataKey::BuyerEscrows(escrow.buyer.clone(), buyer_index as u64),
-        &escrow.escrow_id
+        &escrow.escrow_id,
     );
-    
+
     let mut seller_index = 0;
-    while env.storage().instance().has(&DataKey::SellerEscrows(escrow.seller.clone(), seller_index as u64)) {
+    while env.storage().instance().has(&DataKey::SellerEscrows(
+        escrow.seller.clone(),
+        seller_index as u64,
+    )) {
         seller_index += 1;
     }
     env.storage().instance().set(
         &DataKey::SellerEscrows(escrow.seller.clone(), seller_index as u64),
-        &escrow.escrow_id
+        &escrow.escrow_id,
     );
 }
 
@@ -835,8 +843,16 @@ pub fn get_escrow(env: &Env, escrow_id: u64) -> Option<Escrow> {
 pub fn get_buyer_escrows(env: &Env, buyer: &Address) -> Vec<u64> {
     let mut escrows = Vec::new(env);
     let mut index = 0;
-    while env.storage().instance().has(&DataKey::BuyerEscrows(buyer.clone(), index as u64)) {
-        if let Some(escrow_id) = env.storage().instance().get::<_, u64>(&DataKey::BuyerEscrows(buyer.clone(), index as u64)) {
+    while env
+        .storage()
+        .instance()
+        .has(&DataKey::BuyerEscrows(buyer.clone(), index as u64))
+    {
+        if let Some(escrow_id) = env
+            .storage()
+            .instance()
+            .get::<_, u64>(&DataKey::BuyerEscrows(buyer.clone(), index as u64))
+        {
             escrows.push_back(escrow_id);
         }
         index += 1;
@@ -847,8 +863,16 @@ pub fn get_buyer_escrows(env: &Env, buyer: &Address) -> Vec<u64> {
 pub fn get_seller_escrows(env: &Env, seller: &Address) -> Vec<u64> {
     let mut escrows = Vec::new(env);
     let mut index = 0;
-    while env.storage().instance().has(&DataKey::SellerEscrows(seller.clone(), index as u64)) {
-        if let Some(escrow_id) = env.storage().instance().get::<_, u64>(&DataKey::SellerEscrows(seller.clone(), index as u64)) {
+    while env
+        .storage()
+        .instance()
+        .has(&DataKey::SellerEscrows(seller.clone(), index as u64))
+    {
+        if let Some(escrow_id) = env
+            .storage()
+            .instance()
+            .get::<_, u64>(&DataKey::SellerEscrows(seller.clone(), index as u64))
+        {
             escrows.push_back(escrow_id);
         }
         index += 1;
