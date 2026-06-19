@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Env, String, Symbol, Val,
+    contract, contracterror, contractimpl, token, Address, Env, String, Symbol, Val,
     Vec,
 };
 
@@ -11,7 +11,7 @@ mod types;
 #[cfg(test)]
 mod test;
 
-use stellai_lib::rbac::{self, RoleType};
+use stellai_lib::rbac::{self};
 use storage::*;
 use types::*;
 
@@ -269,7 +269,7 @@ impl Governance {
         let escrow_power = if let Some(escrow) = get_vote_escrow(&env, &address) {
             let current_time = env.ledger().timestamp();
             if escrow.lock_end > current_time {
-                (escrow.amount as u128 * escrow.multiplier as u128) / 10000u128
+                (escrow.amount * escrow.multiplier as u128) / 10000u128
             } else {
                 0
             }
@@ -287,11 +287,7 @@ impl Governance {
         };
 
         let own_power = base_balance + escrow_power;
-        let available_own_power = if own_delegated_away > own_power {
-            0
-        } else {
-            own_power - own_delegated_away
-        };
+        let available_own_power = own_power.saturating_sub(own_delegated_away);
 
         available_own_power + delegated_power
     }
@@ -323,7 +319,7 @@ impl Governance {
 
         let escrow_power = if let Some(escrow) = get_vote_escrow(&env, &delegator) {
             if escrow.lock_end > current_time {
-                (escrow.amount as u128 * escrow.multiplier as u128) / 10000u128
+                (escrow.amount * escrow.multiplier as u128) / 10000u128
             } else {
                 0
             }
@@ -382,7 +378,7 @@ impl Governance {
             panic!("Amount must be greater than 0");
         }
 
-        if lock_duration_weeks < 4 || lock_duration_weeks > 52 {
+        if !(4..=52).contains(&lock_duration_weeks) {
             panic!("Lock duration must be between 4 and 52 weeks");
         }
 
@@ -562,7 +558,7 @@ impl Governance {
 
         while low <= high {
             let mid = (low + high) / 2;
-            let mid_squared = mid.checked_mul(mid).unwrap_or(u128::MAX);
+            let mid_squared = mid.saturating_mul(mid);
 
             if mid_squared == n {
                 return mid;
@@ -582,8 +578,8 @@ impl Governance {
     /// Create delegation snapshot for secure voting
     fn create_delegation_snapshot(env: &Env, proposal_id: u64) {
         let current_block = env.ledger().sequence();
-        let mut delegator_powers = Vec::new(env);
-        let mut total_delegated_power = 0u128;
+        let delegator_powers = Vec::new(env);
+        let total_delegated_power = 0u128;
 
         // In a real implementation, we would iterate through all delegations
         // For now, we create an empty snapshot as a placeholder
@@ -594,18 +590,6 @@ impl Governance {
         };
 
         set_delegation_snapshot(env, proposal_id, &snapshot);
-    }
-
-    /// Get voting power using delegation snapshot for secure voting
-    fn get_voting_power_from_snapshot(env: &Env, voter: &Address, proposal_id: u64) -> u128 {
-        if let Some(_snapshot) = get_delegation_snapshot(env, proposal_id) {
-            // Use snapshot data to calculate voting power at proposal creation time
-            // This prevents changes in delegation from affecting ongoing votes
-            Self::calculate_total_voting_power(env, voter)
-        } else {
-            // Fallback to current voting power if no snapshot
-            Self::calculate_total_voting_power(env, voter)
-        }
     }
 
     /// Update voting mechanism (admin only)
@@ -635,7 +619,7 @@ impl Governance {
         let escrow_power = if let Some(escrow) = get_vote_escrow(env, address) {
             if escrow.lock_end > current_time {
                 // Escrow is still locked, apply multiplier
-                (escrow.amount as u128 * escrow.multiplier as u128) / 10000u128
+                (escrow.amount * escrow.multiplier as u128) / 10000u128
             } else {
                 // Escrow expired, no multiplier
                 0
@@ -665,7 +649,7 @@ impl Governance {
                 // Add escrow power if exists
                 let escrow_power = if let Some(escrow) = storage::get_vote_escrow(env, &delegator) {
                     if escrow.lock_end > current_time {
-                        (escrow.amount as u128 * escrow.multiplier as u128) / 10000u128
+                        (escrow.amount * escrow.multiplier as u128) / 10000u128
                     } else {
                         0
                     }
@@ -1036,7 +1020,7 @@ impl Governance {
         Self::create_storage_snapshot(&env, &entry.target_contract, &entry.target_args);
 
         // Execute the parameter update
-        let result: Val = env.invoke_contract(
+        let _result: Val = env.invoke_contract(
             &entry.target_contract,
             &entry.target_function,
             entry.target_args.clone(),
@@ -1171,15 +1155,15 @@ impl Governance {
 
         if target_args.len() >= 2 {
             let storage_key = target_args.get(0).unwrap();
-            let parameter_name = target_args.get(1).unwrap();
+            let _parameter_name = target_args.get(1).unwrap();
 
             // Try to get current value from target contract
             let before_value = Self::try_get_storage_value(env, target_contract, &storage_key);
 
             let snapshot = types::StorageSnapshot {
                 contract_address: target_contract.clone(),
-                storage_key: storage_key.to_xdr(&env),
-                before_value: before_value.map(|v| v.to_xdr(&env)),
+                storage_key: storage_key.to_xdr(env),
+                before_value: before_value.map(|v| v.to_xdr(env)),
                 after_value: None, // Will be set after execution
                 timestamp: env.ledger().timestamp(),
             };
@@ -1190,9 +1174,9 @@ impl Governance {
 
     /// Attempt to read storage value from target contract (read-only)
     fn try_get_storage_value(
-        env: &Env,
-        target_contract: &Address,
-        storage_key: &Val,
+        _env: &Env,
+        _target_contract: &Address,
+        _storage_key: &Val,
     ) -> Option<Val> {
         // In a real implementation, this would use a read-only contract call
         // to get the current storage value. For now, we return None as placeholder
@@ -1214,7 +1198,7 @@ impl Governance {
 
             // Update snapshot with after value
             let mut updated_snapshot = snapshot;
-            updated_snapshot.after_value = after_value.map(|v| v.to_xdr(&env));
+            updated_snapshot.after_value = after_value.map(|v| v.to_xdr(env));
             storage::set_storage_snapshot(env, &updated_snapshot);
         }
     }
@@ -1251,7 +1235,7 @@ impl Governance {
 
         // Build arguments for the target contract call
         let mut args = Vec::new(&env);
-        args.push_back(storage_key.clone());
+        args.push_back(storage_key);
         args.push_back(new_value.clone().into());
 
         // Execute the parameter change
@@ -1306,10 +1290,10 @@ impl Governance {
         // For now, we execute them sequentially but validate integrity after each
 
         for i in 0..updates.len() {
-            let (param_name, new_value, storage_key) = updates.get(i).unwrap();
+            let (_param_name, new_value, storage_key) = updates.get(i).unwrap();
 
             let mut args = Vec::new(&env);
-            args.push_back(storage_key.clone());
+            args.push_back(storage_key);
             args.push_back(new_value.clone().into());
 
             let _result: Val = env.invoke_contract(
@@ -1578,7 +1562,7 @@ impl Governance {
                         }
                     }
 
-                    let _result: Val = env.invoke_contract(&target, function, args);
+                    let _result: Val = env.invoke_contract(target, function, args);
                 } else {
                     panic!(
                         "ParameterChange proposal missing target contract, function, or parameters"
@@ -1599,7 +1583,7 @@ impl Governance {
                         panic!("ContractUpgrade requires target_args with new contract address");
                     }
 
-                    let _result: Val = env.invoke_contract(&target, function, args);
+                    let _result: Val = env.invoke_contract(target, function, args);
                 } else {
                     panic!("ContractUpgrade proposal missing target contract or function");
                 }
@@ -1623,7 +1607,7 @@ impl Governance {
                         panic!("EmergencyPause proposal missing pause state");
                     }
 
-                    let _result: Val = env.invoke_contract(&target, function, args);
+                    let _result: Val = env.invoke_contract(target, function, args);
                 } else {
                     panic!("EmergencyPause proposal missing target contract or function");
                 }
@@ -1643,7 +1627,7 @@ impl Governance {
 
         // Emit event
         env.events().publish(
-            (Symbol::new(&env, "ProposalExecuted"),),
+            (Symbol::new(env, "ProposalExecuted"),),
             (proposal_id, executor, proposal.proposal_type),
         );
     }
