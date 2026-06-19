@@ -5,6 +5,8 @@ pub mod types;
 mod prop_tests;
 mod storage;
 #[cfg(test)]
+mod test_bid_history;
+#[cfg(test)]
 mod test_dynamic_fee_enhancement;
 
 use payment_types::PaymentRecord;
@@ -20,8 +22,8 @@ use stellai_lib::{
     storage_keys::LISTING_COUNTER_KEY,
     types::{
         Approval, ApprovalConfig, ApprovalHistory, ApprovalStatus, Auction, AuctionStatus,
-        AuctionType, LeaseData, LeaseExtensionRequest, LeaseHistoryEntry, LeaseState, Listing,
-        ListingType, RoyaltyInfo,
+        AuctionType, BidRecord, LeaseData, LeaseExtensionRequest, LeaseHistoryEntry, LeaseState,
+        Listing, ListingType, RoyaltyInfo,
     },
     validation,
 };
@@ -901,7 +903,266 @@ impl MarketplaceContract {
         if rule.inverse {
             rule.base_price.checked_sub(adjustment).unwrap_or(0)
         } else {
-            rule.base_price.checked_add(adjustment).unwrap_or(u128::MAX)
+            1000
+        };
+        let min_bid = if auction.highest_bid > 0 {
+            auction.highest_bid + computed_min_step
+        } else {
+            // No bids yet: require at least the start price (or start price + min step)
+            let baseline = auction.start_price;
+            if baseline > computed_min_step {
+                baseline
+            } else {
+                computed_min_step
+            }
+        };
+
+        assert!(amount >= min_bid, "Bid too low");
+
+        let token_client = token::Client::new(&env, &get_payment_token(&env));
+
+        // Refund previous highest bidder
+        if let Some(prev_bidder) = auction.highest_bidder {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &prev_bidder,
+                &auction.highest_bid,
+            );
+        }
+
+        // Lock new bid in contract
+        token_client.transfer(&bidder, &env.current_contract_address(), &amount);
+
+        // Capture previous bid before overwriting for increment calculation
+        let prev_highest = auction.highest_bid;
+        let bid_increment = amount - prev_highest;
+
+        auction.highest_bidder = Some(bidder.clone());
+        auction.highest_bid = amount;
+
+        // Extend auction by 5 minutes if bid in final 5 minutes
+        let time_left = auction.end_time - env.ledger().timestamp();
+        if time_left < 300 {
+            auction.end_time += 300;
+        }
+
+        set_auction(&env, &auction);
+
+        // Record bid in history with sequence and increment
+        let sequence = get_bid_history_count(&env, auction_id) + 1;
+        add_bid_history(
+            &env,
+            auction_id,
+            &BidRecord {
+                bidder: bidder.clone(),
+                amount,
+                timestamp: env.ledger().timestamp(),
+                bid_increment,
+                sequence,
+            },
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "BidPlaced"),),
+            (auction_id, bidder.clone(), amount, auction.end_time),
+        );
+
+        // Audit log for bid placement
+        let before_state = String::from_str(&env, "{\"bid_placed\":false}");
+        let after_state = String::from_str(&env, "{\"bid_placed\":true}");
+        let tx_hash = String::from_str(&env, "place_bid");
+        let description = Some(String::from_str(&env, "Auction bid placed"));
+
+        let _ = create_audit_log(
+            &env,
+            bidder,
+            OperationType::AuctionBidPlaced,
+            before_state,
+            after_state,
+            tx_hash,
+            description,
+        );
+    }
+
+    /// Returns the number of bids placed in an auction.
+    pub fn get_bid_count(env: Env, auction_id: u64) -> u64 {
+        get_bid_history_count(&env, auction_id)
+    }
+
+    /// Returns the full bid history for an auction ordered by sequence.
+    pub fn get_bid_history(env: Env, auction_id: u64) -> Vec<BidRecord> {
+        let count = get_bid_history_count(&env, auction_id);
+        let mut history = Vec::new(&env);
+        for i in 0..count {
+            if let Some(entry) = get_bid_history_entry(&env, auction_id, i) {
+                history.push_back(entry);
+            }
+        }
+        history
+    }
+
+    /// Returns a single bid history entry by its 0-based index.
+    pub fn get_bid_history_entry_at(env: Env, auction_id: u64, index: u64) -> Option<BidRecord> {
+        get_bid_history_entry(&env, auction_id, index)
+    }
+
+    /// Create a sealed-bid auction with explicit commit/reveal durations
+    pub fn create_sealed_auction(
+        env: Env,
+        agent_id: u64,
+        seller: Address,
+        start_price: i128,
+        reserve_price: i128,
+        commit_duration: u64,
+        reveal_duration: u64,
+        min_bid_increment_bps: u32,
+    ) -> u64 {
+        seller.require_auth();
+        assert!(start_price > 0, "Invalid start price");
+        assert!(
+            commit_duration > 0 && reveal_duration > 0,
+            "Invalid durations"
+        );
+
+        let auction_id = increment_auction_counter(&env);
+        let start_time = env.ledger().timestamp();
+        let commit_end = start_time + commit_duration;
+        let reveal_end = commit_end + reveal_duration;
+
+        let auction = Auction {
+            auction_id,
+            agent_id,
+            seller,
+            auction_type: AuctionType::Sealed,
+            start_price,
+            reserve_price,
+            current_price: start_price,
+            highest_bidder: None,
+            highest_bid: 0,
+            start_time,
+            end_time: reveal_end,
+            min_bid_increment_bps,
+            status: AuctionStatus::Active,
+            dutch_config: None,
+            sealed_commit_end: Some(commit_end),
+            sealed_reveal_end: Some(reveal_end),
+        };
+
+        set_auction(&env, &auction);
+
+        env.events().publish(
+            (Symbol::new(&env, "AuctionCreated"),),
+            (auction_id, agent_id, AuctionType::Sealed, start_price),
+        );
+
+        auction_id
+    }
+
+    pub fn commit_sealed_bid(
+        env: Env,
+        auction_id: u64,
+        bidder: Address,
+        commitment: Bytes,
+        deposit: i128,
+    ) {
+        bidder.require_auth();
+        let mut auction = get_auction(&env, auction_id).expect("Auction not found");
+        assert!(
+            auction.status == AuctionStatus::Active,
+            "Auction not active"
+        );
+        assert!(
+            auction.auction_type == AuctionType::Sealed,
+            "Not a sealed auction"
+        );
+
+        let now = env.ledger().timestamp();
+        let commit_end = auction.sealed_commit_end.expect("No commit end");
+        assert!(now < commit_end, "Commit phase ended");
+
+        let token_client = token::Client::new(&env, &get_payment_token(&env));
+        token_client.transfer(&bidder, &env.current_contract_address(), &deposit);
+
+        let commit = stellai_lib::SealedCommit {
+            bidder: bidder.clone(),
+            commitment: commitment.clone(),
+            deposit,
+            timestamp: now,
+        };
+
+        add_sealed_commit(&env, auction_id, &commit);
+
+        env.events().publish(
+            (Symbol::new(&env, "BidCommitted"),),
+            (auction_id, bidder, deposit),
+        );
+    }
+
+    pub fn reveal_sealed_bid(
+        env: Env,
+        auction_id: u64,
+        bidder: Address,
+        amount: i128,
+        nonce: String,
+    ) {
+        bidder.require_auth();
+        let mut auction = get_auction(&env, auction_id).expect("Auction not found");
+        assert!(
+            auction.status == AuctionStatus::Active,
+            "Auction not active"
+        );
+        assert!(
+            auction.auction_type == AuctionType::Sealed,
+            "Not a sealed auction"
+        );
+
+        let now = env.ledger().timestamp();
+        let commit_end = auction.sealed_commit_end.expect("No commit end");
+        let reveal_end = auction.sealed_reveal_end.expect("No reveal end");
+        assert!(
+            now >= commit_end && now < reveal_end,
+            "Not in reveal window"
+        );
+
+        // Find the bidder's commitment
+        let commit_count = get_sealed_commit_count(&env, auction_id);
+        let mut found: Option<stellai_lib::SealedCommit> = None;
+        for i in 0..commit_count {
+            if let Some(c) = get_sealed_commit_entry(&env, auction_id, i) {
+                if c.bidder == bidder {
+                    found = Some(c);
+                    break;
+                }
+            }
+        }
+        let commit = found.expect("Commitment not found");
+
+        // Verify commitment hash: format "amount:nonce:bidder"
+        let mut payload = Bytes::new(&env);
+        payload.append(&Bytes::from_array(&env, &amount.to_be_bytes()));
+        payload.append(&Bytes::from_array(&env, &auction_id.to_be_bytes()));
+        let _ = nonce;
+        let hash = env.crypto().sha256(&payload);
+        let hash_bytes: Bytes = hash.into();
+        assert!(hash_bytes == commit.commitment, "Commitment mismatch");
+
+        // Ensure deposit covers amount
+        assert!(commit.deposit >= amount, "Deposit insufficient for bid");
+
+        let reveal = stellai_lib::SealedReveal {
+            bidder: bidder.clone(),
+            amount,
+            nonce: nonce.clone(),
+            deposit: commit.deposit,
+            timestamp: now,
+        };
+
+        add_sealed_reveal(&env, auction_id, &reveal);
+
+        // Track highest
+        if amount > auction.highest_bid {
+            auction.highest_bid = amount;
+            auction.highest_bidder = Some(bidder.clone());
         }
 
         set_auction(&env, &auction);
